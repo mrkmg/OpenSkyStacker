@@ -71,16 +71,18 @@ void ImageStacker::process() {
 
     emit updateProgress(tr("Reading light frame 1 of %n", "", targetImageFileNames.length() + 1), 0);
 
-    refImage = readImage(refImageFileName);
+    refImage = readCalibratedImage(refImageFileName);
     if (useDarks) {
         refImage -= masterDark;
     }
+    /*
     if (useFlats) {
         if (bitsPerChannel == BITS_16)
             cv::divide(refImage, masterFlat, refImage, 1, CV_16U);
         else if (bitsPerChannel == BITS_32)
             cv::divide(refImage, masterFlat, refImage, 1, CV_32F);
     }
+    */
 
     // 32-bit float no matter what for the working image
     refImage.convertTo(workingImage, CV_32F);
@@ -91,7 +93,7 @@ void ImageStacker::process() {
         message = tr("Reading light frame %1 of %2").arg(QString::number(k+2), QString::number(targetImageFileNames.length() + 1));
         qDebug() << message;
         if (totalOperations != 0) emit updateProgress(message, 100*currentOperation/totalOperations);
-        Mat targetImage = readImage(targetImageFileNames.at(k));
+        Mat targetImage = readCalibratedImage(targetImageFileNames.at(k));
 
 
         message = tr("Calibrating light frame %1 of %2").arg(QString::number(k+2), QString::number(targetImageFileNames.length() + 1));
@@ -100,12 +102,14 @@ void ImageStacker::process() {
 
         // ------------- CALIBRATION --------------
         if (useDarks) targetImage -= masterDark;
+        /*
         if (useFlats) {
             if (bitsPerChannel == BITS_16)
                 cv::divide(targetImage, masterFlat, targetImage, 1, CV_16U);
             else if (bitsPerChannel == BITS_32)
                 cv::divide(targetImage, masterFlat, targetImage, 1, CV_32F);
         }
+        */
 
         // -------------- ALIGNMENT ---------------
         message = tr("Aligning image %1 of %2").arg(QString::number(k+2), QString::number(targetImageFileNames.length() + 1));
@@ -209,6 +213,50 @@ cv::Mat ImageStacker::averageImages(cv::Mat img1, cv::Mat img2) {
     return result;
 }
 
+Mat ImageStacker::readCalibratedImage(QString filename)
+{
+    LibRaw processor;
+
+    // params for raw processing
+    processor.imgdata.params.use_auto_wb = 0;
+    processor.imgdata.params.use_camera_wb = 1;
+    processor.imgdata.params.no_auto_bright = 1;
+    processor.imgdata.params.output_bps = 16;
+    processor.imgdata.params.no_auto_scale = 1;
+
+    processor.open_file(filename.toUtf8().constData());
+    processor.unpack();
+
+    libraw_rawdata_t &rawdata = processor.imgdata.rawdata;
+
+    if (useFlats) {
+        for (int i = 1; i < rawdata.sizes.raw_height * rawdata.sizes.raw_width; i++) {
+            rawdata.raw_image[i] = rawdata.raw_image[i] / masterFlat[i];
+        }
+    }
+
+    // process raw into readable BGR bitmap
+    processor.dcraw_process();
+
+    libraw_processed_image_t *proc = processor.dcraw_make_mem_image();
+    Mat tmp = Mat(Size(processor.imgdata.sizes.width, processor.imgdata.sizes.height),
+                    CV_16UC3, proc->data);
+
+    // copy data -- slower, but then we can rely on OpenCV's reference counting
+    // also, we have to convert RGB->BGR anyway
+    Mat image = Mat(processor.imgdata.sizes.width, processor.imgdata.sizes.height, CV_16UC3);
+    cvtColor(tmp, image, CV_RGB2BGR);
+
+    if (bitsPerChannel == BITS_32)
+        image.convertTo(image, CV_32F, 1/65535.0);
+
+    // free the memory that otherwise wouldn't have been handled by OpenCV
+    delete proc;
+    processor.recycle();
+
+    return image;
+}
+
 QImage ImageStacker::Mat2QImage(const Mat &src)
 {
     QImage dest(src.cols, src.rows, QImage::Format_RGB32);
@@ -287,6 +335,7 @@ void ImageStacker::stackDarkFlats()
 void ImageStacker::stackFlats()
 {
     // most algorithms compute the median, but we will stick with mean for now
+    /*
     Mat flat1 = readImage(flatFrameFileNames.at(0));
     Mat result = flat1.clone();
 
@@ -315,6 +364,90 @@ void ImageStacker::stackFlats()
         result.convertTo(masterFlat, CV_32F, 1/avg);
     else if (bitsPerChannel == BITS_32)
         masterFlat = result / avg;
+        */
+
+    unsigned short *temp = bayerMean(flatFrameFileNames);
+
+    LibRaw processor;
+
+    // params for raw processing
+    processor.imgdata.params.use_auto_wb = 0;
+    processor.imgdata.params.use_camera_wb = 1;
+    processor.imgdata.params.no_auto_bright = 1;
+    processor.imgdata.params.output_bps = 16;
+    processor.imgdata.params.no_auto_scale = 1;
+
+    processor.open_file(flatFrameFileNames.at(0).toUtf8().constData());
+    processor.unpack();
+
+    libraw_rawdata_t &rawdata = processor.imgdata.rawdata;
+
+    float average = temp[0];
+    for (int i = 1; i < rawdata.sizes.raw_height * rawdata.sizes.raw_width; i++) {
+        average = average + (average - temp[i]) / (i + 1);
+    }
+
+    qDebug() << "Master flat average:" << average;
+
+    masterFlat = new float[rawdata.sizes.raw_height * rawdata.sizes.raw_width];
+    for (int i = 1; i < rawdata.sizes.raw_height * rawdata.sizes.raw_width; i++) {
+        masterFlat[i] = temp[i] / average;
+    }
+
+    processor.recycle();
+
+
+}
+
+unsigned short *ImageStacker::bayerMean(QStringList imageFileNames)
+{
+    QString firstImage = imageFileNames.at(0);
+    LibRaw processor;
+
+    // params for raw processing
+    processor.imgdata.params.use_auto_wb = 0;
+    processor.imgdata.params.use_camera_wb = 1;
+    processor.imgdata.params.no_auto_bright = 1;
+    processor.imgdata.params.output_bps = 16;
+    processor.imgdata.params.no_auto_scale = 1;
+
+    processor.open_file(firstImage.toUtf8().constData());
+    processor.unpack();
+
+    libraw_rawdata_t &rawdata = processor.imgdata.rawdata;
+
+    unsigned long *temp = new unsigned long[rawdata.sizes.raw_height * rawdata.sizes.raw_width];
+    unsigned short *result = new unsigned short[rawdata.sizes.raw_height * rawdata.sizes.raw_width];
+
+    for (int i = 0; i < processor.imgdata.rawdata.sizes.raw_height * processor.imgdata.rawdata.sizes.raw_width; i++) {
+        temp[i] = processor.imgdata.rawdata.raw_image[i];
+    }
+
+    processor.recycle();
+
+    for (int i = 0; i < imageFileNames.size(); i++) {
+        QString image = imageFileNames.at(i);
+
+        processor.open_file(image.toUtf8().constData());
+        processor.unpack();
+
+        libraw_rawdata_t &rawdata = processor.imgdata.rawdata;
+
+        // running average
+        for (int j = 0; j < rawdata.sizes.raw_width * rawdata.sizes.raw_height; j++) {
+            temp[j] += rawdata.raw_image[j];
+        }
+
+        processor.recycle();
+    }
+
+    for (int i = 0; i < processor.imgdata.rawdata.sizes.raw_height * processor.imgdata.rawdata.sizes.raw_width; i++) {
+        result[i] = temp[i] / imageFileNames.size();
+    }
+
+    delete [] temp;
+
+    return result;
 }
 
 Mat ImageStacker::convertAndScaleImage(Mat image)
@@ -452,60 +585,6 @@ cv::Mat ImageStacker::generateAlignedImage(Mat ref, Mat target) {
     return target;
 }
 
-cv::Mat ImageStacker::generateAlignedImageOld(Mat ref, Mat target) {
-    // Convert images to gray scale;
-    Mat ref_gray, target_gray;
-    float scale = 256;
-    if (bitsPerChannel == BITS_16) scale = 1/256.0;
-    ref.convertTo(ref_gray, CV_8U, scale);
-    target.convertTo(target_gray, CV_8U, scale);
-
-    cvtColor(ref_gray, ref_gray, CV_BGR2GRAY);
-    cvtColor(target_gray, target_gray, CV_BGR2GRAY);
-
-    // Define the motion model
-    const int warp_mode = MOTION_EUCLIDEAN;
-
-    // Set a 2x3 or 3x3 warp matrix depending on the motion model.
-    Mat warp_matrix;
-
-    // Initialize the matrix to identity
-    if ( warp_mode == MOTION_HOMOGRAPHY )
-        warp_matrix = Mat::eye(3, 3, CV_32F);
-    else
-        warp_matrix = Mat::eye(2, 3, CV_32F);
-
-    // Specify the number of iterations.
-    int number_of_iterations = 50;
-
-    // Specify the threshold of the increment
-    // in the correlation coefficient between two iterations
-    double termination_eps = 1e-6;
-
-    // Define termination criteria
-    TermCriteria criteria (TermCriteria::COUNT+TermCriteria::EPS, number_of_iterations, termination_eps);
-
-    // Run the ECC algorithm. The results are stored in warp_matrix.
-    findTransformECC(
-                     ref_gray,
-                     target_gray,
-                     warp_matrix,
-                     warp_mode,
-                     criteria
-                 );
-
-    // Storage for warped image.
-    Mat target_aligned;
-
-    if (warp_mode != MOTION_HOMOGRAPHY)
-        // Use warpAffine for Translation, Euclidean and Affine
-        warpAffine(target, target_aligned, warp_matrix, ref.size(), INTER_LINEAR + WARP_INVERSE_MAP);
-    else
-        // Use warpPerspective for Homography
-        warpPerspective (target, target_aligned, warp_matrix, ref.size(),INTER_LINEAR + WARP_INVERSE_MAP);
-
-    return target_aligned;
-}
 
 
 

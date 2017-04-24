@@ -75,6 +75,7 @@ public slots:
 private:
     cv::Mat generateAlignedImage(cv::Mat ref, cv::Mat target);
     cv::Mat averageImages(cv::Mat img1, cv::Mat img2);
+    cv::Mat readCalibratedImage(QString filename);
 
     QImage Mat2QImage(const cv::Mat &src);
 
@@ -83,6 +84,8 @@ private:
     void stackDarks();
     void stackDarkFlats();
     void stackFlats();
+
+    unsigned short *bayerMean(QStringList imageFileNames);
 
     mutable QMutex mutex;
 
@@ -107,11 +110,11 @@ private:
 
     cv::Mat masterDark;
     cv::Mat masterDarkFlat;
-    cv::Mat masterFlat;
+    //cv::Mat masterFlat;
+    float *masterFlat;
 
     cv::Mat convertAndScaleImage(cv::Mat image);
     cv::Mat rawToMat(QString filename);
-    cv::Mat generateAlignedImageOld(cv::Mat ref, cv::Mat target);
 };
 
 #endif // IMAGESTACKER_H
